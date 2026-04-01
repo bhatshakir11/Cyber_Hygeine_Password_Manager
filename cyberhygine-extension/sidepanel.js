@@ -4,6 +4,7 @@
   GET_AUTH_STATUS: "GET_AUTH_STATUS",
   OPEN_LOGIN: "OPEN_LOGIN",
   SYNC_TOKEN_FROM_APP: "SYNC_TOKEN_FROM_APP",
+  SET_TOKEN: "SET_TOKEN",
   REQUEST_BIOMETRIC_GATE: "REQUEST_BIOMETRIC_GATE",
   GRANT_BIOMETRIC_UNLOCK: "GRANT_BIOMETRIC_UNLOCK",
   FETCH_VAULT_FOR_ACTIVE_TAB: "FETCH_VAULT_FOR_ACTIVE_TAB",
@@ -64,12 +65,25 @@ const state = {
 };
 
 let loadingTimeoutId = null;
+let tokenChangeReloadTimer = null;
 
 function clearLoadingTimeout() {
   if (loadingTimeoutId) {
     clearTimeout(loadingTimeoutId);
     loadingTimeoutId = null;
   }
+}
+
+function applyLoadingUi(isLoading) {
+  if (el.loading) el.loading.classList.toggle("hidden", !isLoading);
+  if (el.autofillBtn) el.autofillBtn.disabled = isLoading || state.extensionPasskeyBusy;
+  if (el.refreshBtn) el.refreshBtn.disabled = isLoading || state.extensionPasskeyBusy;
+  if (el.loginBtn) el.loginBtn.disabled = isLoading || state.extensionPasskeyBusy;
+  if (el.syncBtn) el.syncBtn.disabled = isLoading || state.extensionPasskeyBusy;
+  if (el.neverBtn) el.neverBtn.disabled = isLoading || state.extensionPasskeyBusy;
+  if (el.addOpenBtn) el.addOpenBtn.disabled = isLoading || state.extensionPasskeyBusy;
+  if (el.saveAddBtn) el.saveAddBtn.disabled = isLoading || state.extensionPasskeyBusy;
+  if (el.cancelAddBtn) el.cancelAddBtn.disabled = isLoading || state.extensionPasskeyBusy;
 }
 
 const el = {
@@ -256,6 +270,119 @@ async function getStoredToken() {
 
 async function setStoredToken(token) {
   await storageSet({ [CONFIG.TOKEN_KEY]: token });
+}
+
+function isTrustedAppUrl(urlValue) {
+  try {
+    const parsed = new URL(urlValue);
+    const protocol = parsed.protocol.toLowerCase();
+    const hostname = parsed.hostname.toLowerCase();
+    const port = parsed.port || (protocol === "https:" ? "443" : protocol === "http:" ? "80" : "");
+
+    if (!/^https?:$/.test(protocol)) {
+      return false;
+    }
+
+    if (
+      port === "3000" &&
+      (hostname === "localhost" ||
+        hostname === "127.0.0.1" ||
+        hostname === "[::1]" ||
+        hostname.endsWith(".localhost"))
+    ) {
+      return true;
+    }
+
+    return hostname === "cyberhygine.com" || hostname.endsWith(".cyberhygine.com");
+  } catch {
+    return false;
+  }
+}
+
+function sendMessageToTab(tabId, message, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    let completed = false;
+    const timer = window.setTimeout(() => {
+      if (completed) return;
+      completed = true;
+      reject(new Error("Tab message timed out."));
+    }, timeoutMs);
+
+    chrome.tabs.sendMessage(tabId, message, (response) => {
+      if (completed) return;
+      completed = true;
+      window.clearTimeout(timer);
+      const err = chrome.runtime.lastError;
+      if (err) {
+        reject(new Error(err.message));
+        return;
+      }
+      resolve(response || {});
+    });
+  });
+}
+
+async function findTrustedAppTabDirect() {
+  const tabs = await queryTabs({});
+  return tabs.find((tab) => tab && tab.id && tab.url && isTrustedAppUrl(tab.url)) || null;
+}
+
+async function syncTokenFromAppTabDirect() {
+  const appTab = await findTrustedAppTabDirect();
+  if (!appTab || !appTab.id) {
+    return { ok: false, code: CODE.NO_TOKEN };
+  }
+
+  try {
+    const response = await sendMessageToTab(appTab.id, { type: "CYBERHYGIENE_READ_APP_TOKEN" });
+    const token = normalizeString(response && response.token, 4096);
+    if (!token || isJwtExpired(token)) {
+      return { ok: false, code: CODE.UNAUTHORIZED };
+    }
+
+    await setStoredToken(token);
+    try {
+      await sendMessage({ type: "SET_TOKEN", token }, 3000);
+    } catch {
+      // non-fatal
+    }
+    return { ok: true, token };
+  } catch {
+    return { ok: false, code: CODE.NO_TOKEN };
+  }
+}
+
+async function ensureAuthorizedToken() {
+  let token = await getStoredToken();
+  if (token && !isJwtExpired(token)) {
+    return { ok: true, token };
+  }
+
+  const directSync = await syncTokenFromAppTabDirect();
+  if (directSync.ok) {
+    token = normalizeString(directSync.token, 4096);
+  }
+
+  if (!token || isJwtExpired(token)) {
+    try {
+      const syncResult = await sendMessage({ type: MESSAGE.SYNC_TOKEN_FROM_APP }, 5000);
+      if (syncResult && syncResult.ok) {
+        token = await getStoredToken();
+      }
+    } catch {
+      // non-fatal
+    }
+  }
+
+  if (!token) {
+    return { ok: false, code: CODE.NO_TOKEN };
+  }
+
+  if (isJwtExpired(token)) {
+    return { ok: false, code: CODE.UNAUTHORIZED };
+  }
+
+  return { ok: true, token };
 }
 
 function decodeJwtPayload(token) {
@@ -636,7 +763,7 @@ async function fetchVaultDirect(domain) {
 
   try {
     const response = await fetchWithTimeout(
-      `${CONFIG.API_BASE_URL}/credentials`,
+      `${CONFIG.API_BASE_URL}/vault?domain=${encodeURIComponent(requestedDomain)}`,
       {
         method: "GET",
         headers: {
@@ -664,12 +791,12 @@ async function fetchVaultDirect(domain) {
     }
 
     const payload = await response.json();
-    const records = Array.isArray(payload) ? payload : [];
+    const records = Array.isArray(payload && payload.credentials) ? payload.credentials : [];
     const credentials = records
       .map((item) => {
         const id = normalizeString(String(item && item.id), 128);
         const username = normalizeString(item && item.username, 1024);
-        const itemDomain = getBaseDomain(item && item.site);
+        const itemDomain = getBaseDomain(item && (item.domain || item.site));
         if (!id || !username || itemDomain !== requestedDomain) return null;
         return {
           id,
@@ -717,6 +844,29 @@ async function fetchExtensionPasskeyStatus(token) {
   };
 }
 
+async function deleteExtensionPasskeys(token) {
+  const origin = encodeURIComponent(getExtensionOrigin());
+  const { response, payload } = await apiRequest(`/extension-passkeys?origin=${origin}`, {
+    method: "DELETE",
+    token
+  });
+
+  if (response.status === 401) {
+    return { ok: false, code: CODE.UNAUTHORIZED, message: "Session expired. Please login again." };
+  }
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      code: CODE.NETWORK_ERROR,
+      message:
+        normalizeString(payload.detail, 256) || "Could not replace the extension fingerprint."
+    };
+  }
+
+  return { ok: true, deletedCount: Number(payload.deleted_count) || 0 };
+}
+
 function renderExtensionPasskey(errorMessage = "") {
   const shouldShow = state.authorized;
   el.extensionPasskeySection.classList.toggle("hidden", !shouldShow);
@@ -738,7 +888,7 @@ function renderExtensionPasskey(errorMessage = "") {
         ? `${state.extensionPasskeyCount} extension fingerprints are registered.`
         : "1 extension fingerprint is registered.";
     el.extensionPasskeyText.textContent =
-      errorMessage || `${countLabel} Autofill will ask for fingerprint inside this popup.`;
+      errorMessage || `${countLabel} Autofill will ask for fingerprint inside the extension.`;
     el.extensionPasskeyBtn.textContent = state.extensionPasskeyBusy
       ? "Setting up..."
       : "Re-register extension fingerprint";
@@ -747,7 +897,7 @@ function renderExtensionPasskey(errorMessage = "") {
 
   el.extensionPasskeyText.textContent =
     errorMessage ||
-    "Enable a separate fingerprint for this extension so autofill can stay inside the popup.";
+    "Enable a separate fingerprint for this extension so autofill stays inside Cyber Hygiene.";
   el.extensionPasskeyBtn.textContent = state.extensionPasskeyBusy
     ? "Setting up..."
     : "Enable fingerprint in extension";
@@ -1016,29 +1166,22 @@ function setLoading(isLoading) {
     loadingTimeoutId = setTimeout(() => {
       console.warn("setLoading timeout: forcing loader hide");
       state.isLoading = false;
-      if (el.loading) el.loading.classList.add("hidden");
+      applyLoadingUi(false);
       setStatus("Loading timed out. Retry.", "warn");
       renderExtensionPasskey();
     }, 12000);
   }
 
   try {
-    if (el.loading) el.loading.classList.toggle("hidden", !isLoading);
+    applyLoadingUi(isLoading);
     if (isLoading) {
       setLoadingMessage("Loading credentials...");
     }
-    if (el.autofillBtn) el.autofillBtn.disabled = isLoading || state.extensionPasskeyBusy;
-    if (el.refreshBtn) el.refreshBtn.disabled = isLoading || state.extensionPasskeyBusy;
-    if (el.loginBtn) el.loginBtn.disabled = isLoading || state.extensionPasskeyBusy;
-    if (el.syncBtn) el.syncBtn.disabled = isLoading || state.extensionPasskeyBusy;
-    if (el.neverBtn) el.neverBtn.disabled = isLoading || state.extensionPasskeyBusy;
-    if (el.addOpenBtn) el.addOpenBtn.disabled = isLoading || state.extensionPasskeyBusy;
-    if (el.saveAddBtn) el.saveAddBtn.disabled = isLoading || state.extensionPasskeyBusy;
-    if (el.cancelAddBtn) el.cancelAddBtn.disabled = isLoading || state.extensionPasskeyBusy;
     renderExtensionPasskey();
   } catch (error) {
     console.error("setLoading error", error);
-    if (!isLoading && el.loading) el.loading.classList.add("hidden");
+    // ensure we don't leave stale loading indicator on error
+    if (!isLoading) applyLoadingUi(false);
   }
 }
 
@@ -1224,6 +1367,23 @@ async function loadPhishingRisk() {
   renderRisk(null);
 }
 
+async function refreshPasskeyStateAfterRender(hasCredentials) {
+  const result = await withTimeout(
+    refreshExtensionPasskeyState(),
+    8000,
+    "Extension fingerprint check timed out."
+  );
+
+  if (!result.ok && result.code === CODE.UNAUTHORIZED) {
+    await redirectToLogin("Session expired. Please login to Cyber Hygiene.");
+    return;
+  }
+
+  if (hasCredentials && !state.extensionPasskeyEnabled) {
+    setStatus("Enable extension fingerprint to autofill without leaving this popup.", "warn");
+  }
+}
+
 async function loadPopupData() {
   setLoading(true);
   setLoadingMessage("Resolving current site...");
@@ -1261,9 +1421,9 @@ async function loadPopupData() {
     el.domainValue.textContent = state.domain || "-";
     updateNeverButton();
 
-    const storedToken = await getStoredToken();
-    const tokenExpired = storedToken ? isJwtExpired(storedToken) : false;
-    state.authorized = Boolean(storedToken) && !tokenExpired;
+    const tokenState = await ensureAuthorizedToken();
+    const tokenExpired = tokenState.code === CODE.UNAUTHORIZED;
+    state.authorized = Boolean(tokenState.ok);
     state.extensionPasskeySupported = supportsPopupWebAuthn();
 
     state.risk = null;
@@ -1287,20 +1447,8 @@ async function loadPopupData() {
     if (state.blocked) {
       showSection(null);
       setStatus("Autofill is disabled for this site.", "warn");
+      void refreshPasskeyStateAfterRender(false);
       void loadPhishingRisk();
-      return;
-    }
-
-    setLoadingMessage("Checking extension fingerprint...");
-    setStatus("Checking extension fingerprint...", "info");
-    const passkeyStatusResult = await withTimeout(
-      refreshExtensionPasskeyState(),
-      8000,
-      "Extension fingerprint check timed out."
-    );
-
-    if (!passkeyStatusResult.ok && passkeyStatusResult.code === CODE.UNAUTHORIZED) {
-      await redirectToLogin("Session expired. Please login to Cyber Hygiene.");
       return;
     }
 
@@ -1355,18 +1503,15 @@ async function loadPopupData() {
     if (credentials.length === 0) {
       showSection("empty");
       setStatus("No credentials found for this domain.", "info");
+      void refreshPasskeyStateAfterRender(false);
       void loadPhishingRisk();
       return;
     }
 
     populateCredentialSelect(credentials);
     showSection("credentials");
-    if (!state.extensionPasskeyEnabled) {
-      setStatus("Enable extension fingerprint to autofill without leaving this popup.", "warn");
-      void loadPhishingRisk();
-      return;
-    }
     setStatus("Credential found. Click Autofill to continue.", "success");
+    void refreshPasskeyStateAfterRender(true);
     void loadPhishingRisk();
   } catch {
     showSection(null);
@@ -1401,25 +1546,17 @@ async function onExtensionPasskeyClick() {
     return;
   }
 
-  setExtensionPasskeyBusy(true);
-  setStatus("Register your fingerprint for this extension...", "info");
-
   try {
-    const result = await registerExtensionPasskey();
-    if (!result.ok) {
-      if (result.code === CODE.UNAUTHORIZED) {
-        await redirectToLogin(result.message || "Session expired. Please login again.");
-        return;
-      }
-      setStatus(result.message || "Could not register extension fingerprint.", "error");
-      await refreshExtensionPasskeyState();
-      return;
-    }
-
-    await refreshExtensionPasskeyState();
-    setStatus(result.message || "Extension fingerprint registered successfully.", "success");
-  } finally {
-    setExtensionPasskeyBusy(false);
+    const url = chrome.runtime.getURL("passkey-setup.html");
+    await chrome.tabs.create({ url });
+    setStatus(
+      state.extensionPasskeyEnabled
+        ? "Opened extension fingerprint replacement page."
+        : "Opened extension fingerprint setup page.",
+      "info"
+    );
+  } catch {
+    setStatus("Could not open extension fingerprint setup page.", "error");
   }
 }
 
@@ -1450,72 +1587,20 @@ async function onAutofillClick() {
     return;
   }
 
-  setLoading(true);
-  setStatus("Touch your fingerprint sensor to unlock autofill...", "info");
+  const selected = state.credentials.find((item) => item.id === credentialId);
+  const label = encodeURIComponent(selected ? selected.label : "Saved account");
+  const url =
+    chrome.runtime.getURL("autofill-auth.html") +
+    `?tabId=${encodeURIComponent(String(state.tabId || ""))}` +
+    `&domain=${encodeURIComponent(state.domain || "")}` +
+    `&credentialId=${encodeURIComponent(credentialId)}` +
+    `&account=${label}`;
 
   try {
-    const unlock = await unlockForAutofill();
-    if (!unlock.ok) {
-      if (unlock.code === CODE.UNAUTHORIZED) {
-        await redirectToLogin(unlock.message || "Session expired. Please login again.");
-        return;
-      }
-      setStatus(unlock.message || "Fingerprint verification failed.", "error");
-      return;
-    }
-
-    const result = await sendMessage({
-      type: MESSAGE.PERFORM_AUTOFILL,
-      credentialId,
-      tabId: state.tabId,
-      domain: state.domain
-    });
-
-    if (!result.ok) {
-      if (result.code === CODE.NO_TOKEN || result.code === CODE.UNAUTHORIZED) {
-        await redirectToLogin("Session expired. Please login to Cyber Hygiene.");
-        return;
-      }
-
-      if (result.code === CODE.PHISHING_BLOCKED) {
-        setStatus(result.message || "Likely phishing detected. Autofill blocked.", "error");
-        return;
-      }
-
-      if (result.code === CODE.DOMAIN_MISMATCH) {
-        setStatus("Domain mismatch detected. Autofill blocked.", "error");
-        return;
-      }
-
-      if (result.code === CODE.NO_PASSWORD_FIELD) {
-        setStatus("Password field not found on this page.", "warn");
-        return;
-      }
-
-      if (result.code === CODE.CREDENTIAL_NOT_FOUND) {
-        setStatus("Credential is no longer available. Refresh and retry.", "warn");
-        return;
-      }
-
-      setStatus(result.message || "Autofill failed.", "error");
-      return;
-    }
-
-    if (result.code === CODE.PASSWORD_ONLY_FILLED) {
-      setStatus("Password filled. Username/email field not found.", "warn");
-      return;
-    }
-
-    if (result.code === CODE.AUTOFILL_SUCCESS) {
-      setStatus("Credentials autofilled successfully.", "success");
-      return;
-    }
-
-    setStatus("Autofill completed.", "success");
+    await chrome.tabs.create({ url });
+    setStatus("Opened extension fingerprint window for autofill.", "info");
   } catch {
-    setStatus("Autofill error.", "error");
-  } finally {
-    setLoading(false);
+    setStatus("Could not open autofill fingerprint window.", "error");
   }
 }
 
@@ -1665,4 +1750,25 @@ function bindEvents() {
 document.addEventListener("DOMContentLoaded", async () => {
   bindEvents();
   await loadPopupData();
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local" || !changes[CONFIG.TOKEN_KEY]) {
+    return;
+  }
+
+  if (tokenChangeReloadTimer) {
+    window.clearTimeout(tokenChangeReloadTimer);
+  }
+
+  tokenChangeReloadTimer = window.setTimeout(() => {
+    tokenChangeReloadTimer = null;
+    state.autoLoginOpened = false;
+    loadPopupData();
+  }, 250);
+});
+
+window.addEventListener("focus", () => {
+  state.autoLoginOpened = false;
+  loadPopupData();
 });

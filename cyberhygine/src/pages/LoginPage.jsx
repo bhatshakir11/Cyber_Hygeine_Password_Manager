@@ -39,8 +39,10 @@ const LoginPage = () => {
       if (res.data.success) {
         localStorage.setItem("token", res.data.token);
         localStorage.removeItem("user_id");
-        await maybePromptFingerprintRegistration();
         navigate("/dashboard");
+        window.setTimeout(() => {
+          maybePromptFingerprintRegistration();
+        }, 0);
       } else {
         setError(res.data.message || "Invalid credentials");
       }

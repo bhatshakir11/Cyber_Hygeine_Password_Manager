@@ -2,7 +2,6 @@
   if (window.__CYBERHYGIENE_CONTENT_READY__) return;
   window.__CYBERHYGIENE_CONTENT_READY__ = true;
 
-  const TRUSTED_APP_ORIGINS = new Set(["http://localhost:3000", "https://localhost:3000"]);
   const CAPTURE_DEBOUNCE_MS = 8000;
   let lastCaptureKey = "";
   let lastCaptureAt = 0;
@@ -162,6 +161,156 @@
     return candidates.length > 0 ? candidates[0].el : null;
   }
 
+  function getHostnameTokens(hostname) {
+    return normalizeString(hostname)
+      .toLowerCase()
+      .split(".")
+      .filter(Boolean);
+  }
+
+  function getPageTextSample(maxLen = 5000) {
+    const text = normalizeString(
+      (document.body && document.body.innerText) || document.documentElement.innerText || "",
+      maxLen
+    );
+    return text.toLowerCase();
+  }
+
+  function getBrandSignals() {
+    const title = normalizeString(document.title, 256).toLowerCase();
+    const headings = Array.from(document.querySelectorAll("h1, h2, h3, [role='heading']"))
+      .map((el) => normalizeString(el.textContent, 120).toLowerCase())
+      .filter(Boolean)
+      .join(" ");
+    const text = `${title} ${headings} ${getPageTextSample(2500)}`;
+
+    return [
+      { name: "facebook", tokens: ["facebook", "fb"], domains: ["facebook", "fb"] },
+      { name: "google", tokens: ["google", "gmail"], domains: ["google", "gmail"] },
+      { name: "microsoft", tokens: ["microsoft", "outlook", "office", "live"], domains: ["microsoft", "outlook", "office", "live"] },
+      { name: "apple", tokens: ["apple", "icloud"], domains: ["apple", "icloud"] },
+      { name: "amazon", tokens: ["amazon", "aws"], domains: ["amazon", "aws"] },
+      { name: "paypal", tokens: ["paypal"], domains: ["paypal"] },
+      { name: "instagram", tokens: ["instagram"], domains: ["instagram"] },
+      { name: "linkedin", tokens: ["linkedin"], domains: ["linkedin"] },
+      { name: "github", tokens: ["github"], domains: ["github"] },
+      { name: "netflix", tokens: ["netflix"], domains: ["netflix"] },
+      { name: "x", tokens: ["twitter", "x.com"], domains: ["twitter", "x"] },
+      { name: "dropbox", tokens: ["dropbox"], domains: ["dropbox"] }
+    ].filter((brand) => brand.tokens.some((token) => text.includes(token)));
+  }
+
+  function analyzePageForPhishing() {
+    const hostname = normalizeString(window.location.hostname, 512).toLowerCase();
+    const protocol = normalizeString(window.location.protocol, 32).toLowerCase();
+    const baseDomain = getCurrentBaseDomain();
+    const hostnameTokens = getHostnameTokens(hostname);
+    const title = normalizeString(document.title, 256);
+    const passwordInputs = Array.from(document.querySelectorAll('input[type="password"]')).filter(isVisibleInput);
+    const allForms = Array.from(document.forms || []);
+    const visibleIframes = Array.from(document.querySelectorAll("iframe")).filter((frame) => {
+      const style = window.getComputedStyle(frame);
+      return style.display !== "none" && style.visibility !== "hidden";
+    });
+
+    let score = 0;
+    const reasons = [];
+
+    if (protocol === "http:" && baseDomain !== "localhost" && !/^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)) {
+      score += 35;
+      reasons.push("This page is not using HTTPS, which is unusual for a real login page.");
+    }
+
+    if (hostname.startsWith("xn--")) {
+      score += 35;
+      reasons.push("The domain uses punycode characters, which can be used for lookalike phishing domains.");
+    }
+
+    const hyphenCount = (hostname.match(/-/g) || []).length;
+    if (hyphenCount >= 3) {
+      score += 12;
+      reasons.push("The domain contains many hyphens, which is common on fake login domains.");
+    }
+
+    if (hostnameTokens.length >= 4) {
+      score += 10;
+      reasons.push("The site uses an unusually deep subdomain structure.");
+    }
+
+    if (hostname.length >= 35) {
+      score += 8;
+      reasons.push("The hostname is unusually long for a login page.");
+    }
+
+    const suspiciousKeywords = ["verify", "secure", "account", "wallet", "billing", "support", "unlock", "recovery"];
+    const keywordMatches = suspiciousKeywords.filter((word) => hostname.includes(word));
+    if (keywordMatches.length >= 2) {
+      score += 14;
+      reasons.push("The domain mixes urgency or account-related keywords often seen in phishing URLs.");
+    }
+
+    const urgentPhrases = ["verify your account", "confirm your identity", "suspended", "unusual activity", "act now", "limited time"];
+    const pageText = getPageTextSample();
+    const urgentMatches = urgentPhrases.filter((phrase) => pageText.includes(phrase));
+    if (urgentMatches.length > 0) {
+      score += 12;
+      reasons.push("The page uses urgency language that is common in phishing lures.");
+    }
+
+    const externalForms = allForms.filter((form) => {
+      const action = normalizeString(form.getAttribute("action"), 2048);
+      if (!action) return false;
+      try {
+        const actionUrl = new URL(action, window.location.href);
+        const actionDomain = getBaseDomainFromHostname(actionUrl.hostname);
+        return actionDomain && actionDomain !== baseDomain;
+      } catch {
+        return false;
+      }
+    });
+    if (externalForms.length > 0) {
+      score += 24;
+      reasons.push("The login form submits to a different domain than the page you are viewing.");
+    }
+
+    if (visibleIframes.length >= 3 && passwordInputs.length > 0) {
+      score += 10;
+      reasons.push("This login page uses several visible iframes, which can hide deceptive forms.");
+    }
+
+    const detectedBrands = getBrandSignals();
+    const matchedBrands = detectedBrands.filter((brand) =>
+      brand.domains.some((token) => hostname.includes(token))
+    );
+    const mismatchedBrands = detectedBrands.filter((brand) =>
+      !brand.domains.some((token) => hostname.includes(token))
+    );
+
+    // If the page text references several brands but one of them clearly matches
+    // the current domain, treat that as a legitimate brand match instead of phishing.
+    if (matchedBrands.length === 0 && mismatchedBrands.length > 0) {
+      score += 40;
+      reasons.push(`The page looks like ${mismatchedBrands[0].name}, but the domain does not match that brand.`);
+    }
+
+    const hasLoginUi = passwordInputs.length > 0;
+    const level = score >= 60 ? "high" : score >= 30 ? "medium" : "low";
+
+    return {
+      ok: true,
+      code: "OK",
+      domain: baseDomain,
+      hostname,
+      hasLoginUi,
+      score,
+      level,
+      safe: level === "low",
+      blocked: level === "high",
+      label: level === "high" ? "Likely phishing" : level === "medium" ? "Suspicious" : "Safe",
+      reasons: reasons.slice(0, 4)
+    };
+  }
+
   function isHttpPage() {
     return window.location.protocol === "http:" || window.location.protocol === "https:";
   }
@@ -260,7 +409,25 @@
 
   function isTrustedAppOrigin() {
     try {
-      return TRUSTED_APP_ORIGINS.has(window.location.origin.toLowerCase());
+      const protocol = window.location.protocol.toLowerCase();
+      const hostname = window.location.hostname.toLowerCase();
+      const port = window.location.port || (protocol === "https:" ? "443" : protocol === "http:" ? "80" : "");
+
+      if (!/^https?:$/.test(protocol)) {
+        return false;
+      }
+
+      if (
+        port === "3000" &&
+        (hostname === "localhost" ||
+          hostname === "127.0.0.1" ||
+          hostname === "[::1]" ||
+          hostname.endsWith(".localhost"))
+      ) {
+        return true;
+      }
+
+      return hostname === "cyberhygine.com" || hostname.endsWith(".cyberhygine.com");
     } catch {
       return false;
     }
@@ -279,6 +446,36 @@
       return { ok: true, code: "OK", token };
     } catch {
       return { ok: false, code: "TOKEN_READ_ERROR", message: "Could not read app token." };
+    }
+  }
+
+  let lastSyncedAppToken = "";
+
+  function syncAppTokenToExtension(force = false) {
+    if (!isTrustedAppOrigin()) return;
+
+    let token = "";
+    try {
+      token = normalizeString(window.localStorage.getItem("token") || "", 4096);
+    } catch {
+      token = "";
+    }
+
+    if (!force && token === lastSyncedAppToken) {
+      return;
+    }
+
+    lastSyncedAppToken = token;
+    const message = token
+      ? { type: "SET_TOKEN", token }
+      : { type: "CLEAR_TOKEN" };
+
+    try {
+      chrome.runtime.sendMessage(message, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch {
+      // non-fatal
     }
   }
 
@@ -487,6 +684,17 @@
 
   document.addEventListener("submit", onFormSubmit, true);
 
+  if (isTrustedAppOrigin()) {
+    syncAppTokenToExtension(true);
+    window.setInterval(() => syncAppTokenToExtension(false), 2000);
+    window.addEventListener("focus", () => syncAppTokenToExtension(false));
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        syncAppTokenToExtension(false);
+      }
+    });
+  }
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (!message || !message.type) return;
 
@@ -499,6 +707,19 @@
       performBiometricGate().then(sendResponse).catch(() => {
         sendResponse({ ok: false, code: "BIOMETRIC_ERROR", message: "Biometric verification failed." });
       });
+      return true;
+    }
+
+    if (message.type === "CYBERHYGIENE_ANALYZE_PAGE") {
+      try {
+        sendResponse(analyzePageForPhishing());
+      } catch {
+        sendResponse({
+          ok: false,
+          code: "PHISHING_ANALYSIS_ERROR",
+          message: "Could not analyze this page."
+        });
+      }
       return true;
     }
 

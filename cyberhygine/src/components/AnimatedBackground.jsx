@@ -1,6 +1,6 @@
-import React from "react";
+import React, { memo } from "react";
 
-const AnimatedBackground = () => {
+const AnimatedBackground = memo(() => {
   const blobs = [
     { size: 300, color: "#2D333B", top: "10%", left: "10%", delay: 0, duration: 11 },
     { size: 250, color: "#1F242C", top: "60%", left: "70%", delay: 2, duration: 14 },
@@ -38,6 +38,6 @@ const AnimatedBackground = () => {
       ))}
     </div>
   );
-};
+});
 
 export default AnimatedBackground;

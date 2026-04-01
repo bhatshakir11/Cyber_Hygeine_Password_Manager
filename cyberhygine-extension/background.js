@@ -10,10 +10,12 @@
 
 const MESSAGE = Object.freeze({
   GET_ACTIVE_CONTEXT: "GET_ACTIVE_CONTEXT",
+  GET_PHISHING_RISK: "GET_PHISHING_RISK",
   GET_AUTH_STATUS: "GET_AUTH_STATUS",
   OPEN_LOGIN: "OPEN_LOGIN",
   SYNC_TOKEN_FROM_APP: "SYNC_TOKEN_FROM_APP",
   REQUEST_BIOMETRIC_GATE: "REQUEST_BIOMETRIC_GATE",
+  GRANT_BIOMETRIC_UNLOCK: "GRANT_BIOMETRIC_UNLOCK",
   FETCH_VAULT_FOR_ACTIVE_TAB: "FETCH_VAULT_FOR_ACTIVE_TAB",
   PERFORM_AUTOFILL: "PERFORM_AUTOFILL",
   CAPTURE_LOGIN_CREDENTIAL: "CAPTURE_LOGIN_CREDENTIAL",
@@ -35,6 +37,7 @@ const CODE = Object.freeze({
   CREDENTIAL_NOT_FOUND: "CREDENTIAL_NOT_FOUND",
   DOMAIN_MISMATCH: "DOMAIN_MISMATCH",
   PHISHING_BLOCKED: "PHISHING_BLOCKED",
+  PHISHING_WARNING: "PHISHING_WARNING",
   INTERNAL_ERROR: "INTERNAL_ERROR",
   BIOMETRIC_FAILED: "BIOMETRIC_FAILED"
 });
@@ -67,6 +70,8 @@ let biometricUnlock = {
   domain: "",
   expiresAt: 0
 };
+
+const riskCache = new Map();
 
 function normalizeString(value, maxLen = 1024) {
   if (typeof value !== "string") return "";
@@ -195,8 +200,25 @@ async function getActiveTab() {
 function isTrustedAppUrl(urlValue) {
   try {
     const url = new URL(urlValue);
-    const origin = `${url.protocol}//${url.host}`.toLowerCase();
-    return CONFIG.APP_ORIGINS.includes(origin);
+    const protocol = url.protocol.toLowerCase();
+    const hostname = url.hostname.toLowerCase();
+    const port = url.port || (protocol === "https:" ? "443" : protocol === "http:" ? "80" : "");
+
+    if (!/^https?:$/.test(protocol)) {
+      return false;
+    }
+
+    if (
+      port === "3000" &&
+      (hostname === "localhost" ||
+        hostname === "127.0.0.1" ||
+        hostname === "[::1]" ||
+        hostname.endsWith(".localhost"))
+    ) {
+      return true;
+    }
+
+    return hostname === "cyberhygine.com" || hostname.endsWith(".cyberhygine.com");
   } catch {
     return false;
   }
@@ -474,6 +496,66 @@ function hasValidBiometricUnlock(context) {
     biometricUnlock.tabId === context.tabId &&
     biometricUnlock.domain === context.domain
   );
+}
+
+function getRiskCacheKey(tabId, url) {
+  const parsedTabId = Number(tabId);
+  const normalizedUrl = normalizeString(url, 4096);
+  return `${parsedTabId || 0}|${normalizedUrl}`;
+}
+
+function getCachedRisk(tabId, url, maxAgeMs = 5000) {
+  const key = getRiskCacheKey(tabId, url);
+  const cached = riskCache.get(key);
+  if (!cached) return null;
+  if (Date.now() - cached.timestamp > maxAgeMs) {
+    riskCache.delete(key);
+    return null;
+  }
+  return cached.value;
+}
+
+function setCachedRisk(tabId, url, value) {
+  const key = getRiskCacheKey(tabId, url);
+  riskCache.set(key, {
+    timestamp: Date.now(),
+    value
+  });
+}
+
+async function analyzePageRiskForContext(context, maxAgeMs = 5000) {
+  if (!context || !context.ok) {
+    return {
+      ok: false,
+      code: CODE.UNSUPPORTED_PAGE,
+      message: "Unsupported page."
+    };
+  }
+
+  const cached = getCachedRisk(context.tabId, context.url, maxAgeMs);
+  if (cached) {
+    return cached;
+  }
+
+  const result = await analyzePageRiskInTab(context.tabId);
+  if (result && typeof result === "object" && result.ok) {
+    setCachedRisk(context.tabId, context.url, result);
+  }
+  return result;
+}
+
+async function initializeSidePanelBehavior() {
+  if (!chrome.sidePanel || !chrome.sidePanel.setPanelBehavior) {
+    return;
+  }
+
+  try {
+    await chrome.sidePanel.setPanelBehavior({
+      openPanelOnActionClick: true
+    });
+  } catch {
+    // non-fatal
+  }
 }
 
 function firstNonEmptyString(...values) {
@@ -981,6 +1063,55 @@ async function autofillInTab(tabId, domain, credential) {
   }
 }
 
+async function analyzePageRiskInTab(tabId) {
+  const message = { type: "CYBERHYGIENE_ANALYZE_PAGE" };
+
+  try {
+    const result = await sendMessageToTab(tabId, message);
+    if (result && typeof result === "object") return result;
+  } catch {
+    try {
+      await ensureContentScript(tabId);
+      const result = await sendMessageToTab(tabId, message);
+      if (result && typeof result === "object") return result;
+    } catch {
+      return {
+        ok: false,
+        code: CODE.INTERNAL_ERROR,
+        message: "Unable to analyze page risk."
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    code: CODE.INVALID_RESPONSE,
+    message: "Invalid phishing analysis response."
+  };
+}
+
+async function handleGetPhishingRisk(message) {
+  const context = await getContextForRequest(message);
+  if (!context.ok) return context;
+
+  const risk = await analyzePageRiskForContext(context);
+  if (!risk.ok) return risk;
+
+  return {
+    ok: true,
+    code: risk.blocked ? CODE.PHISHING_BLOCKED : risk.level === "medium" ? CODE.PHISHING_WARNING : CODE.OK,
+    domain: context.domain,
+    risk: {
+      score: Number(risk.score) || 0,
+      level: normalizeString(risk.level, 32) || "low",
+      label: normalizeString(risk.label, 64) || "Safe",
+      blocked: Boolean(risk.blocked),
+      safe: Boolean(risk.safe),
+      reasons: Array.isArray(risk.reasons) ? risk.reasons.slice(0, 4) : []
+    }
+  };
+}
+
 async function handleGetAuthStatus() {
   let token = await getToken();
   if (!token) {
@@ -1032,7 +1163,7 @@ async function handleFetchVaultForActiveTab() {
     };
   }
 
-  const context = await getActiveContext();
+  const context = await getContextForRequest({});
   if (!context.ok) return context;
 
   if (context.blocked) {
@@ -1041,6 +1172,17 @@ async function handleFetchVaultForActiveTab() {
       code: CODE.SITE_BLOCKED,
       domain: context.domain,
       message: "Autofill is disabled for this site."
+    };
+  }
+
+  const risk = await analyzePageRiskForContext(context);
+  if (risk.ok && risk.blocked) {
+    return {
+      ok: false,
+      code: CODE.PHISHING_BLOCKED,
+      domain: context.domain,
+      message: "This login page looks like phishing. Autofill is blocked.",
+      risk
     };
   }
 
@@ -1084,6 +1226,21 @@ async function handlePerformAutofill(message) {
       ok: false,
       code: CODE.SITE_BLOCKED,
       message: "Autofill is disabled for this site."
+    };
+  }
+
+  const risk = await analyzePageRiskForContext(context);
+  if (!risk.ok) {
+    return risk;
+  }
+
+  if (risk.blocked) {
+    clearBiometricUnlock();
+    return {
+      ok: false,
+      code: CODE.PHISHING_BLOCKED,
+      message: "This page looks like phishing. Autofill has been blocked.",
+      risk
     };
   }
 
@@ -1158,12 +1315,42 @@ async function handlePerformAutofill(message) {
   return fillResult;
 }
 
+async function handleGrantBiometricUnlock(message) {
+  const context = await getContextForRequest(message);
+  if (!context.ok) return context;
+
+  const token = normalizeString(message && message.token, 4096);
+  if (token) {
+    if (!looksLikeJwt(token) || isJwtExpired(token)) {
+      clearBiometricUnlock();
+      return {
+        ok: false,
+        code: CODE.UNAUTHORIZED,
+        message: "Biometric session expired. Please verify again."
+      };
+    }
+    await setToken(token);
+  }
+
+  setBiometricUnlock(context.tabId, context.domain);
+  return {
+    ok: true,
+    code: CODE.OK,
+    domain: context.domain,
+    tabId: context.tabId
+  };
+}
+
 async function handleMessage(message) {
   const type = message && message.type;
 
   switch (type) {
     case MESSAGE.GET_ACTIVE_CONTEXT: {
       return getActiveContext();
+    }
+
+    case MESSAGE.GET_PHISHING_RISK: {
+      return handleGetPhishingRisk(message);
     }
 
     case MESSAGE.GET_AUTH_STATUS: {
@@ -1185,6 +1372,10 @@ async function handleMessage(message) {
 
     case MESSAGE.REQUEST_BIOMETRIC_GATE: {
       return requestBiometricGateViaAppTab(message);
+    }
+
+    case MESSAGE.GRANT_BIOMETRIC_UNLOCK: {
+      return handleGrantBiometricUnlock(message);
     }
 
     case MESSAGE.FETCH_VAULT_FOR_ACTIVE_TAB: {
@@ -1270,11 +1461,18 @@ async function handleMessage(message) {
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
+  await initializeSidePanelBehavior();
   const data = await storageGet([CONFIG.NEVER_AUTOFILL_KEY]);
   if (!Array.isArray(data[CONFIG.NEVER_AUTOFILL_KEY])) {
     await storageSet({ [CONFIG.NEVER_AUTOFILL_KEY]: [] });
   }
 });
+
+chrome.runtime.onStartup.addListener(() => {
+  initializeSidePanelBehavior();
+});
+
+initializeSidePanelBehavior();
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   handleMessage(message)

@@ -1,16 +1,19 @@
 ﻿{
   "manifest_version": 3,
   "name": "Cyber Hygiene Autofill",
-  "version": "1.0.0",
+  "version": "1.0.3",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsvJSlsg2JxLaTdd3wjxR1DBGfBFVcaRIxCsoKF62/FS2DuNLk1jynUmQ494FSAR5QUSQ1YZ0zhPv2guKAxvlGQLrTp9L8DGFRZRC1eZjy4aJsYCJD46ZW3gbS41yMSLK5SoAoEk5ibkk6R+SJ/StckR3FuRrUWf9hcODycx+ZTbwkfsvNaj9NB/7XD3z7nqXoHKrO/4WU2jbUY4aBiLZ4OBwAkap6fgISaUklI7Ld0/sJlgOQuOY7q5dH+wLqfc0KQ/hGiyzj3urCCbI/NKMpS8rspxcVCVJhEaP6VdsEaIg0VMAEQIAgkcZ4VYJHw54dEdJxS0vvnmO4jRXT0rW7QIDAQAB",
   "description": "Secure domain-locked credential autofill for Cyber Hygiene.",
   "minimum_chrome_version": "116",
   "action": {
     "default_title": "Cyber Hygiene",
-    "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png"
     }
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
   },
   "icons": {
     "16": "icons/icon16.png",
@@ -22,6 +25,7 @@
     "service_worker": "background.js"
   },
   "permissions": [
+    "sidePanel",
     "storage",
     "tabs",
     "activeTab",

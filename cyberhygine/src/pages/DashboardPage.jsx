@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import Navbar from "../components/Navbar";
 import AnimatedBackground from "../components/AnimatedBackground";
 import apiClient from "../apiClient";
@@ -19,22 +19,9 @@ const DashboardPage = () => {
   const [fingerprintSuccess, setFingerprintSuccess] = useState("");
   const [fingerprintLoading, setFingerprintLoading] = useState(false);
   const [deletingFingerprintId, setDeletingFingerprintId] = useState("");
+  const [dashboardLoading, setDashboardLoading] = useState(true);
 
-  useEffect(() => {
-    const fetchStats = () => {
-      apiClient.get("/dashboard").then((res) => {
-        setStats(res.data);
-      });
-      apiClient.get("/credentials").then((res) => {
-        setCredentials(res.data);
-      });
-    };
-    fetchStats();
-    const interval = setInterval(fetchStats, 2000); // Poll every 2s for real-time updates
-    return () => clearInterval(interval);
-  }, []);
-
-  const fetchFingerprints = async () => {
+  const fetchFingerprints = useCallback(async () => {
     try {
       const res = await apiClient.get("/fingerprints");
       setFingerprints(res.data.fingerprints || []);
@@ -42,11 +29,46 @@ const DashboardPage = () => {
     } catch (err) {
       setFingerprintError("Failed to load fingerprints.");
     }
-  };
+  }, []);
+
+  const fetchDashboardData = useCallback(async () => {
+    setDashboardLoading(true);
+    try {
+      const [dashboardRes, credentialsRes, fingerprintsRes] = await Promise.all([
+        apiClient.get("/dashboard"),
+        apiClient.get("/credentials"),
+        apiClient.get("/fingerprints")
+      ]);
+      setStats(dashboardRes.data);
+      setCredentials(credentialsRes.data);
+      setFingerprints(fingerprintsRes.data.fingerprints || []);
+      setFingerprintError("");
+    } catch (err) {
+      setFingerprintError("Failed to load dashboard data.");
+    } finally {
+      setDashboardLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    fetchFingerprints();
-  }, []);
+    fetchDashboardData();
+
+    const refreshOnFocus = () => {
+      fetchDashboardData();
+    };
+    const refreshOnVisibility = () => {
+      if (document.visibilityState === "visible") {
+        fetchDashboardData();
+      }
+    };
+
+    window.addEventListener("focus", refreshOnFocus);
+    document.addEventListener("visibilitychange", refreshOnVisibility);
+    return () => {
+      window.removeEventListener("focus", refreshOnFocus);
+      document.removeEventListener("visibilitychange", refreshOnVisibility);
+    };
+  }, [fetchDashboardData]);
 
   const handleAddFingerprint = async () => {
     setFingerprintSuccess("");
@@ -85,47 +107,48 @@ const DashboardPage = () => {
   };
 
   const hygieneScore = stats.score;
-  const passwordStats = [
+  const passwordStats = useMemo(() => [
     { name: "Strong", value: stats.strong },
     { name: "Medium", value: stats.medium },
     { name: "Weak", value: stats.weak },
-  ];
-  const reusedStats = [
+  ], [stats.strong, stats.medium, stats.weak]);
+  const reusedStats = useMemo(() => [
     { name: "Reused", value: stats.reused },
     { name: "Unique", value: stats.unique },
-  ];
+  ], [stats.reused, stats.unique]);
   const COLORS = ["#00C49F", "#FF8042", "#FFD600"];
 
-  // Generate real-time reminders and tips
-  const reminders = [];
-  const passwordMap = {};
-  credentials.forEach(cred => {
-    // Check for reused passwords
-    if (passwordMap[cred.password]) {
-      passwordMap[cred.password].push(cred.site);
-    } else {
-      passwordMap[cred.password] = [cred.site];
-    }
-    // Weak password alert
-    if (cred.strength === "weak") {
-      reminders.push(`Weak password detected for ${cred.site}`);
-    }
-  });
-  Object.entries(passwordMap).forEach(([pwd, sites]) => {
-    if (sites.length > 1) {
-      reminders.push(`Password reused for: ${sites.join(", ")}`);
-    }
-  });
-  if (reminders.length === 0) {
-    reminders.push("All your passwords are strong and unique! Great job!");
-  }
+  const reminders = useMemo(() => {
+    const items = [];
+    const passwordMap = {};
 
-  // Real-time tips
-  const tips = [];
-  if (stats.weak > 0) tips.push("Consider updating weak passwords to stronger ones.");
-  if (stats.reused > 0) tips.push("Avoid reusing passwords across sites.");
-  if (stats.strong === 0) tips.push("Try to use strong passwords for all accounts.");
-  if (tips.length === 0) tips.push("Your vault is in excellent shape!");
+    credentials.forEach((cred) => {
+      if (passwordMap[cred.password]) {
+        passwordMap[cred.password].push(cred.site);
+      } else {
+        passwordMap[cred.password] = [cred.site];
+      }
+      if (cred.strength === "weak") {
+        items.push(`Weak password detected for ${cred.site}`);
+      }
+    });
+
+    Object.values(passwordMap).forEach((sites) => {
+      if (sites.length > 1) {
+        items.push(`Password reused for: ${sites.join(", ")}`);
+      }
+    });
+
+    return items.length > 0 ? items : ["All your passwords are strong and unique! Great job!"];
+  }, [credentials]);
+
+  const tips = useMemo(() => {
+    const items = [];
+    if (stats.weak > 0) items.push("Consider updating weak passwords to stronger ones.");
+    if (stats.reused > 0) items.push("Avoid reusing passwords across sites.");
+    if (stats.strong === 0) items.push("Try to use strong passwords for all accounts.");
+    return items.length > 0 ? items : ["Your vault is in excellent shape!"];
+  }, [stats.weak, stats.reused, stats.strong]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-blue-900 to-purple-900">
@@ -135,7 +158,15 @@ const DashboardPage = () => {
         <h2 className="text-4xl font-bold bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent mb-8 animate-fade-in">Dashboard</h2>
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 lg:gap-8">
           <div className="glass-card rounded-2xl p-6 text-center animate-fade-in" style={{animationDelay: '0.1s'}}>
-            <h3 className="text-lg font-semibold text-cyan-300 mb-4">Cyber Hygiene Score</h3>
+            <div className="flex items-center justify-between gap-4 mb-4">
+              <h3 className="text-lg font-semibold text-cyan-300">Cyber Hygiene Score</h3>
+              <button
+                onClick={fetchDashboardData}
+                className="rounded-lg border border-cyan-400/30 bg-cyan-500/10 px-3 py-2 text-xs font-semibold text-cyan-100 transition-all hover:bg-cyan-500/20"
+              >
+                {dashboardLoading ? "Refreshing..." : "Refresh"}
+              </button>
+            </div>
             <div className="flex flex-col items-center">
               <PieChart width={180} height={180}>
                 <Pie

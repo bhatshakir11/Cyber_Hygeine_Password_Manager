@@ -20,9 +20,10 @@ const NotesPage = () => {
 
   const handleAdd = async (e) => {
     e.preventDefault();
-    await apiClient.post("/notes", form);
-    const res = await apiClient.get("/notes");
-    setNotes(res.data);
+    const res = await apiClient.post("/notes", form);
+    if (res.data?.note) {
+      setNotes((current) => [...current, res.data.note]);
+    }
     setShowAdd(false);
     setForm({ title: "", content: "" });
   };

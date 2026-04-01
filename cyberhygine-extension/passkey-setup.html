@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Cyber Hygiene Extension Fingerprint</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      :root {
+        --bg0: #02060d;
+        --bg1: #07111e;
+        --panel: rgba(11, 17, 28, 0.96);
+        --border: rgba(0, 181, 216, 0.34);
+        --text: #e6edf3;
+        --muted: #a9b3c1;
+        --cyan: #00b5d8;
+        --mint: #14f1d9;
+        --danger: #ff5d7a;
+        --warn: #f5c542;
+        --ok: #1dd1a1;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(120% 100% at 15% 0%, rgba(0, 181, 216, 0.18), transparent 42%),
+          linear-gradient(145deg, var(--bg0), var(--bg1));
+      }
+
+      .wrap {
+        max-width: 560px;
+        margin: 0 auto;
+        padding: 24px 18px 40px;
+      }
+
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 18px;
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.32);
+      }
+
+      .title {
+        margin: 0 0 8px;
+        font-size: 28px;
+        font-weight: 800;
+        background: linear-gradient(90deg, var(--mint), var(--cyan));
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+
+      .subtitle {
+        margin: 0 0 16px;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+
+      .status {
+        border-radius: 12px;
+        padding: 12px 14px;
+        font-size: 14px;
+        line-height: 1.5;
+        margin-bottom: 14px;
+        border: 1px solid transparent;
+      }
+
+      .status.info {
+        color: #c8e8f8;
+        background: rgba(2, 132, 199, 0.14);
+        border-color: rgba(2, 132, 199, 0.38);
+      }
+
+      .status.success {
+        color: #d6ffef;
+        background: rgba(29, 209, 161, 0.13);
+        border-color: rgba(29, 209, 161, 0.38);
+      }
+
+      .status.warn {
+        color: #fff8d1;
+        background: rgba(245, 197, 66, 0.13);
+        border-color: rgba(245, 197, 66, 0.38);
+      }
+
+      .status.error {
+        color: #ffe6ee;
+        background: rgba(255, 93, 122, 0.13);
+        border-color: rgba(255, 93, 122, 0.38);
+      }
+
+      .meta {
+        display: grid;
+        gap: 10px;
+        margin-bottom: 18px;
+      }
+
+      .meta-row {
+        padding: 12px 14px;
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .meta-label {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 4px;
+      }
+
+      .meta-value {
+        word-break: break-all;
+        font-weight: 700;
+      }
+
+      .actions {
+        display: grid;
+        gap: 10px;
+      }
+
+      button {
+        width: 100%;
+        border: 1px solid transparent;
+        border-radius: 12px;
+        padding: 12px 14px;
+        cursor: pointer;
+        color: #fff;
+        font-size: 15px;
+        font-weight: 700;
+      }
+
+      button:disabled {
+        opacity: 0.65;
+        cursor: not-allowed;
+      }
+
+      .primary {
+        background: linear-gradient(90deg, #0079b8, #00b5d8);
+      }
+
+      .secondary {
+        background: linear-gradient(90deg, #233145, #1d2b3c);
+        border-color: rgba(0, 181, 216, 0.35);
+      }
+
+      .danger {
+        background: linear-gradient(90deg, #b4234e, #ff5d7a);
+      }
+
+      .note {
+        margin-top: 14px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1 class="title">Extension Fingerprint</h1>
+        <p class="subtitle">
+          Register or replace the fingerprint used by the Cyber Hygiene extension for autofill.
+          This stays inside the extension and does not touch your website passkeys.
+        </p>
+
+        <div id="status" class="status info">Checking extension session...</div>
+
+        <div class="meta">
+          <div class="meta-row">
+            <span class="meta-label">Extension Origin</span>
+            <span id="originValue" class="meta-value">-</span>
+          </div>
+          <div class="meta-row">
+            <span class="meta-label">Current Status</span>
+            <span id="passkeyState" class="meta-value">Loading...</span>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button id="setupBtn" class="primary">Enable fingerprint in extension</button>
+          <button id="syncBtn" class="secondary">Sync login from Cyber Hygiene</button>
+          <button id="loginBtn" class="secondary">Open Cyber Hygiene Login</button>
+          <button id="closeBtn" class="danger">Close</button>
+        </div>
+
+        <div class="note">
+          If you removed and re-added the unpacked extension before, the extension ID may have changed.
+          This page uses the current extension origin and will register a fresh extension fingerprint for it.
+        </div>
+      </div>
+    </div>
+
+    <script src="passkey-setup.js"></script>
+  </body>
+</html>

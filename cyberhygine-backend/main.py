@@ -65,7 +65,12 @@ def b64url_encode(data: bytes) -> str:
 
 
 def open_db() -> sqlite3.Connection:
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    return conn
 
 
 def b64url_decode(data: str) -> bytes:
@@ -174,6 +179,7 @@ def verify_client_data(
     client_data_json_b64: str,
     expected_type: str,
     expected_challenge: str,
+    expected_origin: str = WEBAUTHN_ORIGIN,
 ) -> bytes:
     try:
         client_data_json = b64url_decode(client_data_json_b64)
@@ -186,13 +192,13 @@ def verify_client_data(
     if client_data.get("challenge") != expected_challenge:
         raise HTTPException(status_code=400, detail="Invalid or expired challenge")
     origin = str(client_data.get("origin", "")).rstrip("/")
-    if origin != WEBAUTHN_ORIGIN.rstrip("/"):
+    if origin != expected_origin.rstrip("/"):
         raise HTTPException(status_code=400, detail="Invalid origin")
     return client_data_json
 
 
-def verify_rp_id_hash(parsed_authenticator_data: dict) -> None:
-    expected_rp_hash = hashlib.sha256(WEBAUTHN_RP_ID.encode("utf-8")).digest()
+def verify_rp_id_hash(parsed_authenticator_data: dict, expected_rp_id: str = WEBAUTHN_RP_ID) -> None:
+    expected_rp_hash = hashlib.sha256(expected_rp_id.encode("utf-8")).digest()
     if parsed_authenticator_data["rp_id_hash"] != expected_rp_hash:
         raise HTTPException(status_code=400, detail="Invalid RP ID hash")
 
@@ -233,7 +239,46 @@ def ensure_webauthn_table() -> None:
         FOREIGN KEY (user_id) REFERENCES users(id)
     )"""
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_user_id ON webauthn_credentials(user_id)"
+    )
     conn.close()
+
+
+def ensure_extension_webauthn_table() -> None:
+    conn = open_db()
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS extension_webauthn_credentials (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        credential_id TEXT UNIQUE NOT NULL,
+        public_key_spki TEXT NOT NULL,
+        sign_count INTEGER NOT NULL DEFAULT 0,
+        transports TEXT,
+        extension_origin TEXT NOT NULL,
+        rp_id TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )"""
+    )
+    conn.execute(
+        """CREATE INDEX IF NOT EXISTS idx_extension_webauthn_user_origin
+        ON extension_webauthn_credentials(user_id, extension_origin)"""
+    )
+    conn.close()
+
+
+def parse_extension_origin(origin: str) -> tuple[str, str]:
+    raw_origin = str(origin or "").strip()
+    if not raw_origin:
+        raise HTTPException(status_code=400, detail="Extension origin is required")
+
+    parsed = urlparse(raw_origin)
+    if parsed.scheme != "chrome-extension" or not parsed.hostname:
+        raise HTTPException(status_code=400, detail="Invalid extension origin")
+
+    normalized_origin = f"chrome-extension://{parsed.hostname}"
+    return normalized_origin, normalized_origin
 
 
 def create_access_token(user_id: int) -> str:
@@ -280,6 +325,7 @@ def ensure_notes_table():
         content TEXT NOT NULL,
         FOREIGN KEY (user_id) REFERENCES users(id)
     )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_user_id ON notes(user_id)")
     conn.close()
 
 @app.post("/api/notes")
@@ -289,8 +335,9 @@ def add_note(note: Note, user_id: int = Depends(get_current_user_id)):
     cursor = conn.cursor()
     cursor.execute("INSERT INTO notes (user_id, title, content) VALUES (?, ?, ?)", (user_id, note.title, note.content))
     conn.commit()
+    note_id = cursor.lastrowid
     conn.close()
-    return {"success": True}
+    return {"success": True, "note": {"id": note_id, "title": note.title, "content": note.content}}
 
 @app.get("/api/notes")
 def get_notes(user_id: int = Depends(get_current_user_id)):
@@ -326,7 +373,16 @@ def update_credential(
     conn.close()
     if affected == 0:
         raise HTTPException(status_code=404, detail="Credential not found")
-    return {"success": True}
+    return {
+        "success": True,
+        "credential": {
+            "id": cred_id,
+            "site": cred.site,
+            "username": cred.username,
+            "password": cred.password,
+            "strength": cred.strength,
+        },
+    }
 
 def get_cred_db():
     conn = open_db()
@@ -339,6 +395,8 @@ def get_cred_db():
         strength TEXT NOT NULL,
         FOREIGN KEY (user_id) REFERENCES users(id)
     )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_credentials_user_id ON credentials(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_credentials_user_site ON credentials(user_id, site)")
     return conn
 
 # Add credential
@@ -349,8 +407,18 @@ def add_credential(cred: Credential, user_id: int = Depends(get_current_user_id)
     cursor.execute("INSERT INTO credentials (user_id, site, username, password, strength) VALUES (?, ?, ?, ?, ?)",
                    (user_id, cred.site, cred.username, cred.password, cred.strength))
     conn.commit()
+    cred_id = cursor.lastrowid
     conn.close()
-    return {"success": True}
+    return {
+        "success": True,
+        "credential": {
+            "id": cred_id,
+            "site": cred.site,
+            "username": cred.username,
+            "password": cred.password,
+            "strength": cred.strength,
+        },
+    }
 
 # Get all credentials
 @app.get("/api/credentials")
@@ -452,6 +520,7 @@ def get_db():
         username TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL
     )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
     return conn
 
 class UserRegister(BaseModel):
@@ -468,6 +537,21 @@ class FingerprintVerifyRequest(BaseModel):
 
 
 class FingerprintLoginVerifyRequest(BaseModel):
+    attempt_id: str
+    credential: dict
+
+
+class ExtensionPasskeyRequest(BaseModel):
+    origin: str
+
+
+class ExtensionPasskeyVerifyRequest(BaseModel):
+    origin: str
+    credential: dict
+
+
+class ExtensionPasskeyLoginVerifyRequest(BaseModel):
+    origin: str
     attempt_id: str
     credential: dict
 
@@ -739,6 +823,316 @@ def passkey_login_verify(request: FingerprintLoginVerifyRequest):
     return {"success": True, "token": create_access_token(user_id)}
 
 
+@app.get("/api/extension-passkeys/status")
+def extension_passkey_status(
+    origin: str, user_id: int = Depends(get_current_user_id)
+):
+    ensure_extension_webauthn_table()
+    normalized_origin, _ = parse_extension_origin(origin)
+
+    conn = open_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT COUNT(*)
+        FROM extension_webauthn_credentials
+        WHERE user_id = ? AND extension_origin = ?""",
+        (user_id, normalized_origin),
+    )
+    count = cursor.fetchone()[0]
+    conn.close()
+
+    return {
+        "has_passkey": count > 0,
+        "passkey_count": count,
+        "origin": normalized_origin,
+    }
+
+
+@app.delete("/api/extension-passkeys")
+def delete_extension_passkeys(
+    origin: str, user_id: int = Depends(get_current_user_id)
+):
+    ensure_extension_webauthn_table()
+    normalized_origin, _ = parse_extension_origin(origin)
+
+    conn = open_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """DELETE FROM extension_webauthn_credentials
+        WHERE user_id = ? AND extension_origin = ?""",
+        (user_id, normalized_origin),
+    )
+    deleted_count = cursor.rowcount
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "deleted_count": deleted_count,
+        "origin": normalized_origin,
+    }
+
+
+@app.post("/api/extension-passkeys/register/options")
+def extension_passkey_register_options(
+    request: ExtensionPasskeyRequest, user_id: int = Depends(get_current_user_id)
+):
+    ensure_extension_webauthn_table()
+    normalized_origin, rp_id = parse_extension_origin(request.origin)
+
+    conn = open_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT username FROM users WHERE id = ?", (user_id,))
+    user_row = cursor.fetchone()
+    if not user_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+
+    cursor.execute(
+        """SELECT credential_id, transports
+        FROM extension_webauthn_credentials
+        WHERE user_id = ? AND extension_origin = ?""",
+        (user_id, normalized_origin),
+    )
+    existing = cursor.fetchall()
+    conn.close()
+
+    challenge = new_webauthn_challenge()
+    store_webauthn_challenge(f"ext-register:{user_id}:{normalized_origin}", challenge)
+
+    exclude_credentials = []
+    for credential_id, transports in existing:
+        descriptor = {"type": "public-key", "id": credential_id}
+        if transports:
+            try:
+                parsed_transports = json.loads(transports)
+                if isinstance(parsed_transports, list):
+                    descriptor["transports"] = parsed_transports
+            except json.JSONDecodeError:
+                pass
+        exclude_credentials.append(descriptor)
+
+    options = {
+        "challenge": challenge,
+        "rp": {"name": f"{WEBAUTHN_RP_NAME} Extension"},
+        "user": {
+            "id": b64url_encode(str(user_id).encode("utf-8")),
+            "name": user_row[0],
+            "displayName": user_row[0],
+        },
+        "pubKeyCredParams": [
+            {"type": "public-key", "alg": -7},
+            {"type": "public-key", "alg": -257},
+        ],
+        "timeout": 60000,
+        "attestation": "none",
+        "excludeCredentials": exclude_credentials,
+        "authenticatorSelection": {
+            "authenticatorAttachment": "platform",
+            "residentKey": "required",
+            "userVerification": "required",
+        },
+        "extensions": {
+            "credProps": True,
+        },
+    }
+    return {"options": options, "origin": normalized_origin, "rp_id": rp_id}
+
+
+@app.post("/api/extension-passkeys/register/verify")
+def extension_passkey_register_verify(
+    request: ExtensionPasskeyVerifyRequest, user_id: int = Depends(get_current_user_id)
+):
+    ensure_extension_webauthn_table()
+    normalized_origin, rp_id = parse_extension_origin(request.origin)
+    expected_challenge = pop_webauthn_challenge(
+        f"ext-register:{user_id}:{normalized_origin}"
+    )
+    if not expected_challenge:
+        raise HTTPException(status_code=400, detail="Registration challenge expired")
+
+    credential = request.credential or {}
+    response = credential.get("response") or {}
+    credential_id = credential.get("id")
+    client_data_json_b64 = response.get("clientDataJSON")
+    authenticator_data_b64 = response.get("authenticatorData")
+    public_key_b64 = response.get("publicKey")
+
+    if (
+        not credential_id
+        or not client_data_json_b64
+        or not authenticator_data_b64
+        or not public_key_b64
+    ):
+        raise HTTPException(
+            status_code=400, detail="Incomplete WebAuthn registration payload"
+        )
+
+    client_data_json = verify_client_data(
+        client_data_json_b64,
+        expected_type="webauthn.create",
+        expected_challenge=expected_challenge,
+        expected_origin=normalized_origin,
+    )
+    _ = client_data_json
+
+    authenticator_data = b64url_decode(authenticator_data_b64)
+    parsed_auth_data = parse_authenticator_data(authenticator_data)
+    verify_rp_id_hash(parsed_auth_data, expected_rp_id=rp_id)
+    require_webauthn_flags(parsed_auth_data["flags"], require_uv=True)
+
+    transports = response.get("transports") or []
+    transports_json = json.dumps(transports if isinstance(transports, list) else [])
+
+    conn = open_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT user_id, extension_origin
+        FROM extension_webauthn_credentials
+        WHERE credential_id = ?""",
+        (credential_id,),
+    )
+    existing = cursor.fetchone()
+    if existing and existing[0] != user_id:
+        conn.close()
+        raise HTTPException(
+            status_code=409,
+            detail="This extension fingerprint is already linked to another user",
+        )
+
+    if existing:
+        cursor.execute(
+            """UPDATE extension_webauthn_credentials
+            SET public_key_spki = ?, sign_count = ?, transports = ?, extension_origin = ?, rp_id = ?
+            WHERE credential_id = ?""",
+            (
+                public_key_b64,
+                parsed_auth_data["sign_count"],
+                transports_json,
+                normalized_origin,
+                rp_id,
+                credential_id,
+            ),
+        )
+    else:
+        cursor.execute(
+            """INSERT INTO extension_webauthn_credentials
+            (user_id, credential_id, public_key_spki, sign_count, transports, extension_origin, rp_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                user_id,
+                credential_id,
+                public_key_b64,
+                parsed_auth_data["sign_count"],
+                transports_json,
+                normalized_origin,
+                rp_id,
+            ),
+        )
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "message": "Extension fingerprint registered successfully",
+        "origin": normalized_origin,
+    }
+
+
+@app.post("/api/extension-passkeys/login/options")
+def extension_passkey_login_options(request: ExtensionPasskeyRequest):
+    normalized_origin, rp_id = parse_extension_origin(request.origin)
+    challenge = new_webauthn_challenge()
+    attempt_id = secrets.token_urlsafe(18)
+    store_webauthn_challenge(f"ext-login:{attempt_id}:{normalized_origin}", challenge)
+    options = {
+        "challenge": challenge,
+        "timeout": 60000,
+        "userVerification": "required",
+    }
+    return {
+        "options": options,
+        "attempt_id": attempt_id,
+        "origin": normalized_origin,
+        "rp_id": rp_id,
+    }
+
+
+@app.post("/api/extension-passkeys/login/verify")
+def extension_passkey_login_verify(request: ExtensionPasskeyLoginVerifyRequest):
+    ensure_extension_webauthn_table()
+    normalized_origin, rp_id = parse_extension_origin(request.origin)
+    expected_challenge = pop_webauthn_challenge(
+        f"ext-login:{request.attempt_id}:{normalized_origin}"
+    )
+    if not expected_challenge:
+        raise HTTPException(status_code=400, detail="Login challenge expired")
+
+    credential = request.credential or {}
+    response = credential.get("response") or {}
+    credential_id = credential.get("id")
+    client_data_json_b64 = response.get("clientDataJSON")
+    authenticator_data_b64 = response.get("authenticatorData")
+    signature_b64 = response.get("signature")
+
+    if (
+        not credential_id
+        or not client_data_json_b64
+        or not authenticator_data_b64
+        or not signature_b64
+    ):
+        raise HTTPException(
+            status_code=400, detail="Incomplete WebAuthn authentication payload"
+        )
+
+    client_data_json = verify_client_data(
+        client_data_json_b64,
+        expected_type="webauthn.get",
+        expected_challenge=expected_challenge,
+        expected_origin=normalized_origin,
+    )
+
+    authenticator_data = b64url_decode(authenticator_data_b64)
+    signature = b64url_decode(signature_b64)
+    parsed_auth_data = parse_authenticator_data(authenticator_data)
+    verify_rp_id_hash(parsed_auth_data, expected_rp_id=rp_id)
+    require_webauthn_flags(parsed_auth_data["flags"], require_uv=True)
+
+    conn = open_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        """SELECT user_id, public_key_spki, sign_count
+        FROM extension_webauthn_credentials
+        WHERE credential_id = ? AND extension_origin = ? AND rp_id = ?""",
+        (credential_id, normalized_origin, rp_id),
+    )
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=401, detail="Extension fingerprint not recognized")
+
+    user_id, public_key_spki, current_sign_count = row
+    verify_assertion_signature(public_key_spki, authenticator_data, client_data_json, signature)
+
+    new_sign_count = parsed_auth_data["sign_count"]
+    if new_sign_count and current_sign_count and new_sign_count <= current_sign_count:
+        conn.close()
+        raise HTTPException(
+            status_code=401, detail="Extension fingerprint sign counter validation failed"
+        )
+
+    cursor.execute(
+        """UPDATE extension_webauthn_credentials
+        SET sign_count = ?
+        WHERE credential_id = ?""",
+        (new_sign_count, credential_id),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"success": True, "token": create_access_token(user_id)}
+
+
 @app.get("/api/fingerprints/status")
 def fingerprint_status(user_id: int = Depends(get_current_user_id)):
     result = passkey_status(user_id)
@@ -821,6 +1215,82 @@ from reportlab.graphics import renderPDF
 from reportlab.graphics.shapes import Drawing
 from reportlab.graphics.charts.piecharts import Pie
 
+def build_report_insights(stats, credentials):
+    total = len(credentials)
+    password_groups = {}
+    weak_sites = []
+
+    for cred in credentials:
+        password_groups.setdefault(cred["password"], []).append(cred["site"])
+        if cred["strength"] == "weak":
+            weak_sites.append(cred["site"])
+
+    reused_groups = [sites for sites in password_groups.values() if len(sites) > 1]
+    reused_accounts = sum(len(sites) for sites in reused_groups)
+    largest_reuse_group = max(reused_groups, key=len, default=[])
+
+    summary_parts = []
+    if total == 0:
+        summary_parts.append(
+            "Your vault is empty right now, so your next best move is adding important accounts with strong unique passwords."
+        )
+    else:
+        summary_parts.append(
+            f"Your current cyber hygiene score is {stats['score']}% across {total} saved accounts."
+        )
+        if stats["reused"] > 0:
+            summary_parts.append(
+                f"The biggest risk is password reuse across {stats['reused']} saved accounts."
+            )
+        elif stats["weak"] > 0:
+            summary_parts.append(
+                f"The main issue is {stats['weak']} weak password{'s' if stats['weak'] != 1 else ''} that should be upgraded first."
+            )
+        else:
+            summary_parts.append(
+                "Your vault is in strong shape with no reused passwords detected."
+            )
+
+    priority_actions = []
+    if largest_reuse_group:
+        reuse_sites = ", ".join(largest_reuse_group[:4])
+        priority_actions.append(
+            f"Change the reused password shared by {len(largest_reuse_group)} accounts first: {reuse_sites}."
+        )
+    if weak_sites:
+        weak_preview = ", ".join(weak_sites[:4])
+        priority_actions.append(
+            f"Upgrade weak passwords on: {weak_preview}."
+        )
+    if total > 0 and stats["strong"] == 0:
+        priority_actions.append(
+            "None of the saved passwords are marked strong yet, so generate new unique passwords for your most important accounts."
+        )
+    if total > 0 and not priority_actions:
+        priority_actions.append(
+            "Keep using unique passwords and review high-value accounts regularly to maintain this score."
+        )
+
+    highlights = []
+    if stats["strong"] > 0:
+        highlights.append(
+            f"{stats['strong']} account{'s already use' if stats['strong'] != 1 else ' already uses'} strong passwords."
+        )
+    if reused_accounts > 0:
+        highlights.append(
+            f"{reused_accounts} saved account{'s are' if reused_accounts != 1 else ' is'} exposed to breach spread because of reuse."
+        )
+    if stats["weak"] > 0:
+        highlights.append(
+            f"{stats['weak']} weak password{'s were' if stats['weak'] != 1 else ' was'} found in the vault."
+        )
+
+    return {
+        "summary": " ".join(summary_parts),
+        "priority_actions": priority_actions,
+        "highlights": highlights,
+    }
+
 def generate_pdf_report(user_id):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=letter)
@@ -833,11 +1303,32 @@ def generate_pdf_report(user_id):
 
     # Password Strength Stats
     stats = dashboard_stats(user_id)
+    credentials = get_credentials(user_id)
+    insights = build_report_insights(stats, credentials)
+
+    story.append(Paragraph("Personalized Summary", styles['h2']))
+    story.append(Paragraph(insights["summary"], styles['BodyText']))
+    story.append(Spacer(1, 8))
+
+    if insights["highlights"]:
+        story.append(Paragraph("Key Findings", styles['h3']))
+        for item in insights["highlights"]:
+            story.append(Paragraph(f"- {item}", styles['BodyText']))
+        story.append(Spacer(1, 8))
+
+    if insights["priority_actions"]:
+        story.append(Paragraph("Fix These First", styles['h3']))
+        for item in insights["priority_actions"]:
+            story.append(Paragraph(f"- {item}", styles['BodyText']))
+        story.append(Spacer(1, 12))
+
     story.append(Paragraph("Password Strength", styles['h2']))
     story.append(Paragraph(f"Strong: {stats['strong']}", styles['Normal']))
     story.append(Paragraph(f"Medium: {stats['medium']}", styles['Normal']))
     story.append(Paragraph(f"Weak: {stats['weak']}", styles['Normal']))
     story.append(Paragraph(f"Cyber Hygiene Score: {stats['score']}%", styles['Normal']))
+    story.append(Paragraph(f"Reused Accounts: {stats['reused']}", styles['Normal']))
+    story.append(Paragraph(f"Unique Passwords: {stats['unique']}", styles['Normal']))
     story.append(Spacer(1, 12))
     
     # Pie Chart
@@ -862,7 +1353,6 @@ def generate_pdf_report(user_id):
 
     # Credentials Table
     story.append(Paragraph("Stored Credentials", styles['h2']))
-    credentials = get_credentials(user_id)
     if credentials:
         table_data = [['Site', 'Username', 'Password', 'Strength']]
         for cred in credentials:

@@ -26,8 +26,8 @@
 
       body {
         margin: 0;
-        width: 380px;
-        min-height: 460px;
+        width: 100%;
+        min-height: 100vh;
         color: var(--text);
         font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
         background: radial-gradient(120% 90% at 15% 5%, #0b1c2f 0%, transparent 45%),
@@ -37,6 +37,7 @@
       .container {
         position: relative;
         padding: 14px;
+        min-height: 100vh;
       }
 
       .glow {
@@ -387,7 +388,7 @@
 
         <div id="loading" class="card loader hidden">
           <span class="spinner"></span>
-          <span>Loading credentials...</span>
+          <span id="loadingText">Loading credentials...</span>
         </div>
 
         <div id="credentialsSection" class="card hidden">
@@ -431,6 +432,6 @@
       </div>
     </div>
 
-    <script src="popup.js"></script>
+    <script src="sidepanel.js"></script>
   </body>
 </html>
